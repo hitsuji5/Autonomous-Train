@@ -78,22 +78,26 @@ class Operator(object):
 class Train(object):
     """Train class simulates real train dynamics
     """
-    def __init__(self, drive_noise=0.1, sensor_noise=3., num_sensor=3,
-                 sensor_outlier=100, p_outlier=0.01, mass=1000, init_state=None):
+    def __init__(self, sensor_noise=3., num_sensor=3, sensor_outlier=100, p_outlier=0.01,
+                 air_resistance=1e-2, tau=1, mass=1000, init_state=None):
         self.mass = mass
-        self.drive_noise = drive_noise
+        self.drive_noise = 0
         self.sensor_noise = sensor_noise
         self.num_sensor = num_sensor
         self.sensor_outlier = sensor_outlier
         self.p_outlier = p_outlier
+        self.air_resistance = air_resistance
+        self.air_noise = 0
+        self.tau = tau
         self.x = [[0, 0, 0]] if init_state is None else init_state
         self.energy = []
         self.t = 0
 
-    def move(self, driving_force, dt, c=1):
+    def move(self, driving_force, dt, drive_noise=0.1, air_noise=1e-3):
         r, v, a = self.x[-1]
-        a = (driving_force - c * v) / self.mass
-        a = np.random.normal(a, self.drive_noise)
+        self.drive_noise += np.random.normal(-self.drive_noise*(dt/self.tau), drive_noise)
+        self.air_noise += np.random.normal(-self.air_noise*(dt/self.tau), air_noise)
+        a = driving_force/ self.mass  + self.drive_noise - (self.air_resistance + self.air_noise) * v
         r += v * dt + a * dt ** 2 / 2
         v = v + a * dt
         self.x.append([r, v, a])
@@ -113,7 +117,7 @@ class Train(object):
         return True if v < 0.01 and r > L else False
 
     def eval(self, x_pred):
-        x_true = np.array(self.x)
+        x_true = np.array(self.x)[:, :2]
         mse = ((x_pred - x_true) ** 2).mean(0)
         return mse
 
@@ -124,11 +128,11 @@ class Train(object):
 class Kalman(object):
     """Kalman class is a Kalman Filter algorithm for train tracking
     """
-    def __init__(self, x0, P0, dt=0.1, drive_noise=0.1, sensor_noise=3.0, num_sensor=3, sensor_delay=0.01):
-        self.F = np.array([[1, dt], [0, 1]])
+    def __init__(self, x0, P0, dt=0.1, state_noise=0.3, air_resistance=1e-2, sensor_noise=3.0, num_sensor=3, sensor_delay=0.01):
+        self.F = np.array([[1, dt], [0, 1 - air_resistance * dt]])
         self.B = np.array([dt**2/2, dt])
         G = np.array([dt ** 2 / 2, dt])
-        self.R_w = G * G[:, None] * drive_noise ** 2
+        self.R_w = G * G[:, None] * state_noise ** 2
         self.H = np.array([[1, -sensor_delay] for _ in range(num_sensor)])
         self.sensor_noise = sensor_noise
         self.R_v = np.eye(num_sensor) * sensor_noise ** 2
@@ -178,7 +182,7 @@ class Controller(object):
             rp, vp = r_, v_
         return 0, start_index
 
-    def run(self, train=None, filter=None, dt=0.1, amax=1.2, bmax=-1.2, verbose=False):
+    def run(self, train=None, filter=None, dt=0.1, amax=2.0, bmax=-1.0, verbose=False):
         if not train:
             train = Train()
         index = 0
@@ -186,16 +190,20 @@ class Controller(object):
         int_error = 0
         total_err = 0
         n = 0
-        u = 0
+        # u = 0
+        if filter:
+            r, v = filter.x[-1]
+        else:
+            r, v, _ = train.x[-1]
         nmax = len(self.run_curve) * 2 / dt
         while not train.is_stopped() and n < nmax:
-            if filter:
-                z = train.measure()
-                filter.update_noise(z)
-                x, P = filter.predict(z, u)
-                r, v = x
-            else:
-                r, v, _ = train.x[-1]
+            # if filter:
+            #     z = train.measure()
+            #     filter.update_noise(z)
+            #     x, P = filter.predict(z, u)
+            #     r, v = x
+            # else:
+            #     r, v, _ = train.x[-1]
 
             target, index = self.target_speed(r + 1.0, index)
             diff_error = (target - v - error) / dt
@@ -207,6 +215,15 @@ class Controller(object):
             if verbose:
                 print driving_force
             train.move(driving_force, dt)
+
+            if filter:
+                z = train.measure()
+                filter.update_noise(z)
+                x, P = filter.predict(z, u)
+                r, v = x
+            else:
+                r, v, _ = train.x[-1]
+
             total_err += (error ** 2)
             n += 1
         return train, total_err / float(n)
